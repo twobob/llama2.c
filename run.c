@@ -595,21 +595,13 @@ int main(int argc, char *argv[]) {
 
   
     // for saving files
-    time_t t = time(NULL);
-    struct tm *tm_info = localtime(&t);
-    char timestamp[26];
-    strftime(timestamp, 26, "%Y%m%d%H%M%S", tm_info);
-
-    char tokens_so_far[MAX_STRING_SIZE] = "";
-
-    tokens_so_far[0] = '\0';
-
-    FILE *output_file = NULL; // Declare 
-
-	FILE *timelog_file = NULL; // Declare 
-
+	char timestamp[26];
+	char tokens_so_far[MAX_STRING_SIZE];
+	FILE *output_file = NULL;
+	FILE *timelog_file = NULL;
 	char time_log[MAX_STRING_SIZE];
 
+	initialize_file_saving(timestamp, tokens_so_far, &output_file, &timelog_file, time_log);
 
     // read in the model.bin file
     Config config;
@@ -672,20 +664,8 @@ int main(int argc, char *argv[]) {
     }
 
     // for saving files
-    //time_t t = time(NULL);
-    //struct tm *tm_info = localtime(&t);
-    //char timestamp[26];
-    //strftime(timestamp, 26, "%Y%m%d%H%M%S", tm_info);
-
-    //char dirname[] = "inbox";
-    // Check if directory exists
-    if (ACCESS_CMD(dirname, 0) == -1) {
-        fprintf(stderr, "Directory %s does not exist. Attempting to create it.\n", dirname);
-        // If directory doesn't exist, create it
-        if (MKDIR_CMD(dirname) == -1) {
-            fprintf(stderr, "Unable to create directory %s!\n", dirname);
-            return 1;
-        }
+    if (create_directory(dirname) != 0) {
+        return 1;
     }
     
 
@@ -697,30 +677,8 @@ int main(int argc, char *argv[]) {
 	if (topp < 1.0) {fprintf(stderr, "using topp\n");} 
     if (print_tokens > 0) {fprintf(stderr, "<s>\n");} // explicit print the initial BOS token for stylistic symmetry reasons
 
+    handle_log_file(saveLogBool, groupLogBool, dirname, COMPILER, extractNumber(checkpoint), time_log);
 
-				
-	//snprintf(time_log, MAX_FILENAME_LENGTH, "%s/%s_%s_%iM_timelog.csv",dirname,COMPILER,timestamp,extractNumber(checkpoint));
-	
-	if (saveLogBool)
-		{
-			
-		if (!groupLogBool)	
-					// individual log names per COMPILER
-			snprintf(time_log, MAX_FILENAME_LENGTH, "%s/%s_%iM_timelog.csv",dirname,COMPILER,extractNumber(checkpoint));
-		else	
-				// grouped into one file per compiler
-			snprintf(time_log, MAX_FILENAME_LENGTH, "%s/All_%iM_timelog.csv",dirname,extractNumber(checkpoint));
-
-		timelog_file = fopen(time_log, "a");
-		if (!timelog_file) {
-			fprintf(stderr, "Unable to open the %s file %s!\n", dirname,time_log);
-			return 1;
-		}
-	
-        // individual log headers per COMPILER
-        // TODO EMBED ARGVs or some of them
-        fprintf(timelog_file, "\n%s-%i-%ld,",COMPILER,extractNumber(checkpoint) ,time_in_ms());	
-        }
 
   // Now run the loop
 
@@ -774,44 +732,22 @@ int main(int argc, char *argv[]) {
         if (print_tokens > 0) {fflush(stdout);} 
 	if (next == 1 && singleBOS > 0)  {
 
-			if(saveFileBool > 0 ){ 
+	save_prompt_to_file(saveFileBool, prompt, dirname, timestamp, tokens_so_far);
 
-				char decoded_prompt[MAX_STRING_SIZE];
-
-				
-				strncpy(decoded_prompt, base64_encode((const unsigned char*)prompt, 75), MAX_STRING_SIZE);
-				
-				snprintf(filename, MAX_FILENAME_LENGTH, "%s/%s_%s.txt",dirname,decoded_prompt,timestamp);
-				
-
-
-				output_file = fopen(filename, "w");
-				if (!output_file) {
-					fprintf(stderr, "Unable to open the %s file %s!\n", dirname,filename);
-					return 1;
-				}
-
-				fprintf(output_file, "%s", tokens_so_far);
-				memset(tokens_so_far, 0, sizeof(tokens_so_far));
-				fclose(output_file);
-			}
 		break;
 		}
 		
-		//if (saveLogBool) fprintf(timelog_file, "%ld,", time_in_ms());		
         }
 
-	if (saveLogBool) {
-		flush_log_buffer(timelog_file);
-		fclose(timelog_file);
-	}
-	//if (saveLogBool) fclose(timelog_file);
+	finalize_log_file(saveLogBool, timelog_file);
+
     // report achieved tok/s
         //if (pos > 1) {
         long end = time_in_ms();
 	//#ifdef COMPILER
         fprintf(stderr, "\n\nachieved tok/s: %f for %s", (steps-1) / (double)(end-start)*1000, COMPILER);
     //#else
+		
 	//	fprintf(stderr, "\n\nachieved tok/s: %f", (steps-1) / (double)(end-start)*1000);
     //#endif
 		//    }
