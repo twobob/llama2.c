@@ -8,21 +8,35 @@ Then run with:
 $ ./run
 */
 
+#include "base64_utils.h"
+#include "save_to_file.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <time.h>
+#include <fcntl.h> // For O_RDONLY
 #include <math.h>
 #include <string.h>
 #include <fcntl.h>
 #if defined _WIN32
+    #include <io.h>   // for _access
+    #include <fcntl.h> // For O_RDONLY
     #include "win.h"
+    #include <direct.h>  // for creating directory
+	#define OPEN_CMD _open
+	#define CLOSE_CMD _close
+	#define ACCESS_CMD _access
+	#define MKDIR_CMD(path) _mkdir(path)
 #else
     #include <unistd.h>
     #include <sys/mman.h>
+	#include <sys/stat.h>
+	#define OPEN_CMD open    
+	#define CLOSE_CMD close
+	#define ACCESS_CMD access
+	#define MKDIR_CMD(path) mkdir(path, 0700)
 #endif
 // ----------------------------------------------------------------------------
 // Transformer and RunState structs, and related memory management
-
 typedef struct {
     int dim; // transformer dimension
     int hidden_dim; // for ffn layers
@@ -51,8 +65,8 @@ typedef struct {
     // final rmsnorm
     float* rms_final_weight; // (dim,)
     // freq_cis for RoPE relatively positional embeddings
-    float* freq_cis_real; // (seq_len, head_size/2)
-    float* freq_cis_imag; // (seq_len, head_size/2)
+    float* freq_cis_real; // (seq_len, dim/2)
+    float* freq_cis_imag; // (seq_len, dim/2)
     // (optional) classifier weights for the logits, on the last layer
     float* wcls;
 } TransformerWeights;
@@ -96,8 +110,8 @@ void malloc_run_state(RunState* s, Config* p) {
     s->key_cache = calloc(p->n_layers * p->seq_len * p->dim, sizeof(float));
     s->value_cache = calloc(p->n_layers * p->seq_len * p->dim, sizeof(float));
     // ensure all mallocs went fine
-    if (!s->x || !s->xb || !s->xb2 || !s->hb || !s->hb2 || !s->q
-     || !s->k || !s->v || !s->att || !s->logits || !s->key_cache
+    if (!s->x || !s->xb || !s->xb2 || !s->hb || !s->hb2 || !s->q 
+     || !s->k || !s->v || !s->att || !s->logits || !s->key_cache 
      || !s->value_cache || !s->probindex) {
         fprintf(stderr, "malloc failed!\n");
         exit(EXIT_FAILURE);
@@ -240,7 +254,27 @@ void transformer(int token, int pos, Config* p, RunState* s, TransformerWeights*
         matmul(s->k, s->xb, w->wk + l*dim*dim, dim, dim);
         matmul(s->v, s->xb, w->wv + l*dim*dim, dim, dim);
 
-        // RoPE relative positional encoding: complex-valued rotate q and k by freq_cis in each head
+        // apply RoPE rotation to the q and k vectors for each head
+        //for (int h = 0; h < p->n_heads; h++) {
+        //    // get the q and k vectors for this head
+        //    float* q = s->q + h * head_size;
+        //    float* k = s->k + h * head_size;
+        //    // rotate q and k by the freq_cis_real and freq_cis_imag
+        //    for (int i = 0; i < head_size; i+=2) {
+        //        float q0 = q[i];
+        //        float q1 = q[i+1];
+        //        float k0 = k[i];
+        //        float k1 = k[i+1];
+        //        float fcr = freq_cis_real_row[i/2];
+        //        float fci = freq_cis_imag_row[i/2];
+        //        q[i]   = q0 * fcr - q1 * fci;
+        //        q[i+1] = q0 * fci + q1 * fcr;
+        //        k[i]   = k0 * fcr - k1 * fci;
+        //        k[i+1] = k0 * fci + k1 * fcr;
+        //    }
+        //}
+        
+// RoPE relative positional encoding: complex-valued rotate q and k by freq_cis in each head
         for (int i = 0; i < dim; i+=2) {
             float q0 = s->q[i];
             float q1 = s->q[i+1];
@@ -260,7 +294,7 @@ void transformer(int token, int pos, Config* p, RunState* s, TransformerWeights*
         float* value_cache_row = s->value_cache + loff + pos * dim;
         memcpy(key_cache_row, s->k, dim*sizeof(*key_cache_row));
         memcpy(value_cache_row, s->v, dim*sizeof(*value_cache_row));
-
+        
         // multihead attention. iterate over all heads
         int h;
         #pragma omp parallel for private(h)
@@ -314,7 +348,7 @@ void transformer(int token, int pos, Config* p, RunState* s, TransformerWeights*
         // first calculate self.w1(x) and self.w3(x)
         matmul(s->hb, s->xb, w->w1 + l*dim*hidden_dim, dim, hidden_dim);
         matmul(s->hb2, s->xb, w->w3 + l*dim*hidden_dim, dim, hidden_dim);
-
+        
         // F.silu; silu(x)=x*σ(x),where σ(x) is the logistic sigmoid
         for (int i = 0; i < hidden_dim; i++) {
             s->hb[i] = s->hb[i] * (1.0f / (1.0f + expf(-s->hb[i])));
@@ -331,7 +365,7 @@ void transformer(int token, int pos, Config* p, RunState* s, TransformerWeights*
         // residual connection
         accum(x, s->xb, dim);
     }
-
+    
     // final rmsnorm
     rmsnorm(x, x, w->rms_final_weight, dim);
 
@@ -353,7 +387,7 @@ int str_lookup(char *str, char **vocab, int vocab_size) {
 }
 
 void bpe_encode(char *text, char **vocab, float *vocab_scores, int vocab_size, unsigned int max_token_length, int *tokens, int *n_tokens) {
-
+    
     // a temporary buffer to merge two consecutive tokens
     char* str_buffer = malloc((max_token_length*2+1) * sizeof(char)); // *2 for concat, +1 for null terminator
 
@@ -402,7 +436,7 @@ void bpe_encode(char *text, char **vocab, float *vocab_scores, int vocab_size, u
 }
 
 // ----------------------------------------------------------------------------
-// utilities: time / rng
+// utilities
 
 long time_in_ms() {
     // return time in milliseconds, for benchmarking the model speed
@@ -423,11 +457,11 @@ float random_f32() { // random float32 in [0,1)
     return (random_u32() >> 8) / 16777216.0f;
 }
 
-// ----------------------------------------------------------------------------
-// sampling can be done in a few ways: greedy argmax, sampling, top-p sampling
+
+
 
 int argmax(float* probabilities, int n) {
-    // return the index that has the highest probability
+
     int max_i = 0;
     float max_p = probabilities[0];
     for (int i = 1; i < n; i++) {
@@ -440,7 +474,7 @@ int argmax(float* probabilities, int n) {
 }
 
 int sample(float* probabilities, int n) {
-    // sample index from probabilities (they must sum to 1!)
+    // sample index from probabilities, they must sum to 1
     float r = random_f32();
     float cdf = 0.0f;
     for (int i = 0; i < n; i++) {
@@ -459,7 +493,7 @@ int compare(const void* a, const void* b) {
     if (a_->prob < b_->prob) return 1;
     return 0;
 }
-
+    // return argmax of v in elements 0..n
 int sample_topp(float* probabilities, int n, float topp, ProbIndex* probindex) {
     // top-p sampling (or "nucleus sampling") samples from the smallest set of
     // tokens that exceed probability topp. This way we never sample tokens that
@@ -469,7 +503,7 @@ int sample_topp(float* probabilities, int n, float topp, ProbIndex* probindex) {
     for (int i = 0; i < n; i++) {
         probindex[i].index = i;
         probindex[i].prob = probabilities[i];
-    }
+        }
     qsort(probindex, n, sizeof(ProbIndex), compare);
 
     // truncate the list where cumulative probability exceeds topp
@@ -480,10 +514,10 @@ int sample_topp(float* probabilities, int n, float topp, ProbIndex* probindex) {
         if (cumulative_prob > topp) {
             last_idx = i;
             break; // we've exceeded topp by including last_idx
-        }
     }
+}
+// ----------------------------------------------------------------------------
 
-    // sample from the truncated list
     float r = random_f32() * cumulative_prob;
     float cdf = 0.0f;
     for (int i = 0; i <= last_idx; i++) {
@@ -507,21 +541,35 @@ void error_usage() {
     fprintf(stderr, "  -p <float>  p value in top-p (nucleus) sampling. default 1.0 (=off)\n");
     fprintf(stderr, "  -s <int>    random seed, default time(NULL)\n");
     fprintf(stderr, "  -n <int>    number of steps to run for, default 256. 0 = max_seq_len\n");
-    fprintf(stderr, "  -i <string> input prompt\n");
+    fprintf(stderr, "  -i <string> prompt string, default none\n");
+    fprintf(stderr, "  -p <float>  p value in top-p (nucleus) sampling. default 0.9, 0 = off\n");
+    fprintf(stderr, "  -k <int> print_tokens, 1 or 0 flag default 1\n");
+    fprintf(stderr, "  -f <int> saveFileBool, 1 or 0 flag default 1\n");
+    fprintf(stderr, "  -l <int> saveLogBool, 1 or 0 flag saves timestamps for tokens gen default 0\n");
+	fprintf(stderr, "  -g <int> groupLogBool, 1 or 0 flag group output by compiler default 0\n");
+    fprintf(stderr, "  -b <int> singleBOS, 1 or 0 flag default 1\n");
+    fprintf(stderr, "  -d <string> dirname string, default none\n");
     exit(EXIT_FAILURE);
 }
 
 int main(int argc, char *argv[]) {
 
-    // default inits
+    // poor man's C argparse
     char *checkpoint = NULL;  // e.g. out/model.bin
     float temperature = 1.0f; // 0.0 = greedy deterministic. 1.0 = original. don't set higher
     float topp = 1.0f;        // top-p in nucleus sampling. 1.0 = off. 0.9 works well, but slower
     rng_seed = 0; // seed rng with time by default
-    int steps = 256;          // number of steps to run for
-    char *prompt = NULL;      // prompt string
+    int steps = 256;          // max number of steps to run for, 0: use seq_len
+    char *prompt = NULL;         // prompt string
+	int print_tokens = 1;        // supress printing
+	int saveFileBool = 1;        // save to file printing
+	int saveLogBool = 0;         // save token timestamps to log
+	int groupLogBool = 0;        // group timelogs by compiler		
+	char *dirname = "inbox"; 
+	char filename[MAX_FILENAME_LENGTH];
+	int singleBOS = 1;        // save to file printing
 
-    // poor man's C argparse so we can override the defaults above from the command line
+
     if (argc >= 2) { checkpoint = argv[1]; } else { error_usage(); }
     for (int i = 2; i < argc; i+=2) {
         // do some basic validation
@@ -534,16 +582,41 @@ int main(int argc, char *argv[]) {
         else if (argv[i][1] == 's') { rng_seed = atoi(argv[i + 1]); }
         else if (argv[i][1] == 'n') { steps = atoi(argv[i + 1]); }
         else if (argv[i][1] == 'i') { prompt = argv[i + 1]; }
+	else if (argv[i][1] == 'k') { print_tokens = atoi( argv[i + 1]); }
+	else if (argv[i][1] == 'f') { saveFileBool = atoi( argv[i + 1]); }
+	else if (argv[i][1] == 'l') { saveLogBool = atoi( argv[i + 1]); }
+	else if (argv[i][1] == 'g') { groupLogBool = atoi( argv[i + 1]); }
+	else if (argv[i][1] == 'b') { singleBOS = atoi( argv[i + 1]); }
+        else if (argv[i][1] == 'd') { dirname = argv[i + 1]; }
         else { error_usage(); }
     }
     if(rng_seed == 0) { rng_seed =  (unsigned int)time(NULL);}
+
+
+  
+    // for saving files
+    time_t t = time(NULL);
+    struct tm *tm_info = localtime(&t);
+    char timestamp[26];
+    strftime(timestamp, 26, "%Y%m%d%H%M%S", tm_info);
+
+    char tokens_so_far[MAX_STRING_SIZE] = "";
+
+    tokens_so_far[0] = '\0';
+
+    FILE *output_file = NULL; // Declare 
+
+	FILE *timelog_file = NULL; // Declare 
+
+	char time_log[MAX_STRING_SIZE];
+
 
     // read in the model.bin file
     Config config;
     TransformerWeights weights;
     int fd = 0;         // file descriptor for memory mapping
     float* data = NULL; // memory mapped data pointer
-    ssize_t file_size;     // size of the checkpoint file in bytes
+    long file_size;     // size of the checkpoint file in bytes
     {
         FILE *file = fopen(checkpoint, "rb");
         if (!file) { fprintf(stderr, "Couldn't open file %s\n", checkpoint); return 1; }
@@ -557,7 +630,7 @@ int main(int argc, char *argv[]) {
         file_size = ftell(file); // get the file size, in bytes
         fclose(file);
         // memory map the Transformer weights into the data pointer
-        fd = open(checkpoint, O_RDONLY); // open in read only mode
+		fd = _open(checkpoint, O_RDONLY); // Open in read-only mode
         if (fd == -1) { fprintf(stderr, "open failed!\n"); return 1; }
         data = mmap(NULL, file_size, PROT_READ, MAP_PRIVATE, fd, 0);
         if (data == MAP_FAILED) { fprintf(stderr, "mmap failed!\n"); return 1; }
@@ -598,11 +671,59 @@ int main(int argc, char *argv[]) {
         bpe_encode(prompt, vocab, vocab_scores, config.vocab_size, max_token_length, prompt_tokens, &num_prompt_tokens);
     }
 
+    // for saving files
+    //time_t t = time(NULL);
+    //struct tm *tm_info = localtime(&t);
+    //char timestamp[26];
+    //strftime(timestamp, 26, "%Y%m%d%H%M%S", tm_info);
+
+    //char dirname[] = "inbox";
+    // Check if directory exists
+    if (ACCESS_CMD(dirname, 0) == -1) {
+        fprintf(stderr, "Directory %s does not exist. Attempting to create it.\n", dirname);
+        // If directory doesn't exist, create it
+        if (MKDIR_CMD(dirname) == -1) {
+            fprintf(stderr, "Unable to create directory %s!\n", dirname);
+            return 1;
+        }
+    }
+    
+
     // start the main loop
     long start = 0;  // used to time our code, only initialized after first iteration
     int next;        // will store the next token in the sequence
     int token = 1;   // init with token 1 (=BOS), as done in Llama-2 sentencepiece tokenizer
     int pos = 0;     // position in the sequence
+	if (topp < 1.0) {fprintf(stderr, "using topp\n");} 
+    if (print_tokens > 0) {fprintf(stderr, "<s>\n");} // explicit print the initial BOS token for stylistic symmetry reasons
+
+
+				
+	//snprintf(time_log, MAX_FILENAME_LENGTH, "%s/%s_%s_%iM_timelog.csv",dirname,COMPILER,timestamp,extractNumber(checkpoint));
+	
+	if (saveLogBool)
+		{
+			
+		if (!groupLogBool)	
+					// individual log names per COMPILER
+			snprintf(time_log, MAX_FILENAME_LENGTH, "%s/%s_%iM_timelog.csv",dirname,COMPILER,extractNumber(checkpoint));
+		else	
+				// grouped into one file per compiler
+			snprintf(time_log, MAX_FILENAME_LENGTH, "%s/All_%iM_timelog.csv",dirname,extractNumber(checkpoint));
+
+		timelog_file = fopen(time_log, "a");
+		if (!timelog_file) {
+			fprintf(stderr, "Unable to open the %s file %s!\n", dirname,time_log);
+			return 1;
+		}
+	
+        // individual log headers per COMPILER
+        // TODO EMBED ARGVs or some of them
+        fprintf(timelog_file, "\n%s-%i-%ld,",COMPILER,extractNumber(checkpoint) ,time_in_ms());	
+        }
+
+  // Now run the loop
+
     while (pos < steps) {
 
         // forward the transformer to get logits for the next token
@@ -624,43 +745,85 @@ int main(int argc, char *argv[]) {
                 softmax(state.logits, config.vocab_size);
                 // we sample from this distribution to get the next token
                 if (topp <= 0 || topp >= 1) {
-                    // simply sample from the predicted probability distribution
+				
                     next = sample(state.logits, config.vocab_size);
                 } else {
                     // top-p (nucleus) sampling, clamping the least likely tokens to zero
                     next = sample_topp(state.logits, config.vocab_size, topp, state.probindex);
                 }
             }
-        }
+        }     
         pos++;
-
-        // data-dependent terminating condition: the BOS (1) token delimits sequences
-        if (next == 1) { break; }
-
-        // following BOS (1) token, sentencepiece decoder strips any leading whitespace (see PR #89)
-        char *token_str = (token == 1 && vocab[next][0] == ' ') ? vocab[next]+1 : vocab[next];
-        printf("%s", token_str);
-        fflush(stdout);
-        token = next;
-
-        // init the timer here because the first iteration can be slower
+	token = next;
+        // init our timer here because the first iteration is slow due to memmap
         if (start == 0) { start = time_in_ms(); }
-    }
-    printf("\n");
+	if (saveLogBool) {add_timestamp_to_log_buffer(time_in_ms(), timelog_file);}	
 
-    // report achieved tok/s (pos-1 because the timer starts after first iteration)
-    if (pos > 1) {
+ // following BOS token (1), sentencepiece decoder strips any leading whitespace (see PR #89)
+        char *token_str = (token == 1 && vocab[next][0] == ' ') ? vocab[next]+1 : vocab[next];
+		
+		token_str = replaceDoubleQuotesWithFullwidth(token_str);
+		
+		stripNewlines(token_str);
+        if (print_tokens > 0) {fprintf(stderr, "%s", token_str);}
+		if(saveFileBool > 0 ){
+
+			strcat_s(tokens_so_far, MAX_STRING_SIZE, token_str);
+		}
+
+        if (print_tokens > 0) {fflush(stdout);} 
+	if (next == 1 && singleBOS > 0)  {
+
+			if(saveFileBool > 0 ){ 
+
+				char decoded_prompt[MAX_STRING_SIZE];
+
+				
+				strncpy(decoded_prompt, base64_encode((const unsigned char*)prompt, 75), MAX_STRING_SIZE);
+				
+				snprintf(filename, MAX_FILENAME_LENGTH, "%s/%s_%s.txt",dirname,decoded_prompt,timestamp);
+				
+
+
+				output_file = fopen(filename, "w");
+				if (!output_file) {
+					fprintf(stderr, "Unable to open the %s file %s!\n", dirname,filename);
+					return 1;
+				}
+
+				fprintf(output_file, "%s", tokens_so_far);
+				memset(tokens_so_far, 0, sizeof(tokens_so_far));
+				fclose(output_file);
+			}
+		break;
+		}
+		
+		//if (saveLogBool) fprintf(timelog_file, "%ld,", time_in_ms());		
+        }
+
+	if (saveLogBool) {
+		flush_log_buffer(timelog_file);
+		fclose(timelog_file);
+	}
+	//if (saveLogBool) fclose(timelog_file);
+    // report achieved tok/s
+        //if (pos > 1) {
         long end = time_in_ms();
-        fprintf(stderr, "achieved tok/s: %f\n", (pos-1) / (double)(end-start)*1000);
-    }
-
+	//#ifdef COMPILER
+        fprintf(stderr, "\n\nachieved tok/s: %f for %s", (steps-1) / (double)(end-start)*1000, COMPILER);
+    //#else
+	//	fprintf(stderr, "\n\nachieved tok/s: %f", (steps-1) / (double)(end-start)*1000);
+    //#endif
+		//    }
     // memory and file handles cleanup
     free_run_state(&state);
     for (int i = 0; i < config.vocab_size; i++) { free(vocab[i]); }
     free(vocab);
     free(vocab_scores);
+    free(output_file);
+    fclose(output_file);
     if (prompt_tokens != NULL) free(prompt_tokens);
     if (data != MAP_FAILED) munmap(data, file_size);
-    if (fd != -1) close(fd);
+    if (fd != -1) _close(fd); // Close the file descriptor
     return 0;
 }
