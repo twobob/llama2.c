@@ -6,16 +6,12 @@
     #include <fcntl.h>
     #include "win.h"
     #include <direct.h>
-    #define OPEN_CMD _open
-    #define CLOSE_CMD _close
     #define ACCESS_CMD _access
     #define MKDIR_CMD(path) _mkdir(path)
 #else
     #include <unistd.h>
     #include <sys/mman.h>
     #include <sys/stat.h>
-    #define OPEN_CMD open
-    #define CLOSE_CMD close
     #define ACCESS_CMD access
     #define MKDIR_CMD(path) mkdir(path, 0700)
 #endif

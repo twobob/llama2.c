@@ -2,6 +2,11 @@
 #ifndef SAVE_TO_FILE_H
 #define SAVE_TO_FILE_H
 
+#pragma warning(disable: 4996)
+
+#define open _open
+#define close _close
+
 #include <stdio.h>
 
 #define MAX_FILENAME_LENGTH 127

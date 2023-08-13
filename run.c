@@ -18,22 +18,12 @@ $ ./run
 #include <string.h>
 #include <fcntl.h>
 #if defined _WIN32
-    #include <io.h>   // for _access
-    #include <fcntl.h> // For O_RDONLY
     #include "win.h"
-    #include <direct.h>  // for creating directory
-	#define OPEN_CMD _open
-	#define CLOSE_CMD _close
-	#define ACCESS_CMD _access
-	#define MKDIR_CMD(path) _mkdir(path)
+	#include <io.h>
 #else
     #include <unistd.h>
     #include <sys/mman.h>
 	#include <sys/stat.h>
-	#define OPEN_CMD open    
-	#define CLOSE_CMD close
-	#define ACCESS_CMD access
-	#define MKDIR_CMD(path) mkdir(path, 0700)
 #endif
 // ----------------------------------------------------------------------------
 // Transformer and RunState structs, and related memory management
