@@ -117,8 +117,10 @@ void save_prompt_to_file(int saveFileBool, const char *prompt, const char *dirna
             fprintf(stderr, "Unable to open the %s file %s!\\n", dirname, filename);
             return;
         }
+		
 
         fprintf(output_file, "%s", tokens_so_far);
+		fflush(output_file);
         memset(tokens_so_far, 0, MAX_STRING_SIZE);
         fclose(output_file);
     }

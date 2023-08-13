@@ -735,12 +735,14 @@ int main(int argc, char *argv[]) {
         if (print_tokens > 0) {fflush(stdout);} 
 	if (next == 1 && singleBOS > 0)  {
 
-	save_prompt_to_file(saveFileBool, prompt, dirname, timestamp, tokens_so_far);
+
 
 		break;
 		}
 		
         }
+
+	save_prompt_to_file(saveFileBool, prompt, dirname, timestamp, tokens_so_far);
 
 	finalize_log_file(saveLogBool, timelog_file);
 
