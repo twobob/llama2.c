@@ -11,7 +11,7 @@ int create_directory(const char *dirname);
 
 long log_time_in_ms();
 
-void handle_log_file(int saveLogBool, int groupLogBool, const char *dirname, const char *compiler_name, int checkpoint,  char *time_log);
+void handle_log_file(int saveLogBool, int groupLogBool, const char *dirname, const char *compiler_name, int checkpoint, char *time_log, FILE **timelog_file) ;
 
 
 void initialize_file_saving(char *timestamp, char *tokens_so_far, FILE **output_file, FILE **timelog_file, char *time_log) ;

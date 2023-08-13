@@ -677,7 +677,10 @@ int main(int argc, char *argv[]) {
 	if (topp < 1.0) {fprintf(stderr, "using topp\n");} 
     if (print_tokens > 0) {fprintf(stderr, "<s>\n");} // explicit print the initial BOS token for stylistic symmetry reasons
 
-    handle_log_file(saveLogBool, groupLogBool, dirname, COMPILER, extractNumber(checkpoint), time_log);
+    //handle_log_file(saveLogBool, groupLogBool, dirname, COMPILER, extractNumber(checkpoint), time_log);
+
+	handle_log_file(saveLogBool, groupLogBool, dirname, COMPILER, extractNumber(checkpoint), time_log, &timelog_file);
+
 
 
   // Now run the loop
