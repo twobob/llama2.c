@@ -80,7 +80,7 @@ void add_timestamp_to_log_buffer(long timestamp, FILE *timelog_file) {
     //printf("Added timestamp: %ld at index: %zu\n", timestamp, log_buffer_count); // Debug print
     log_buffer_count++;
     if (log_buffer_count == LOG_BUFFER_SIZE) {
-        printf("Buffer full, writing to file\n"); // Debug print
+        //printf("Buffer full, writing to file\n"); // Debug print
         for (size_t i = 0; i < LOG_BUFFER_SIZE; i++) {
             fprintf(timelog_file, "%ld,", log_buffer[i]);
 		}
