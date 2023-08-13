@@ -69,9 +69,9 @@ void handle_log_file(int saveLogBool, int groupLogBool, const char *dirname, con
         fprintf(*timelog_file, "\n%s-%i-%ld,", compiler_name, checkpoint, log_time_in_ms());
 		fflush(*timelog_file);
 		
-		printf("\n%s-%i-%ld,", compiler_name, checkpoint, log_time_in_ms());
+		//printf("\n%s-%i-%ld,", compiler_name, checkpoint, log_time_in_ms());
 		
-		printf("Header created, writing to file\n"); // Debug print
+		//printf("Header created, writing to file\n"); // Debug print
     }
 }
 
