@@ -1,0 +1,47 @@
+.PHONY: winmingw
+winmingw: 
+	x86_64-w64-mingw32-gcc -Ofast -DLLAMAC_AVX2 -fno-math-errno -finline-small-functions -fexpensive-optimizations -ffinite-loops  -funroll-all-loops  -fopenmp -DCOMPILER=\"MINGW\"  -D_WIN32 -o runmingw.exe -I. -xc run.c win.c base64_utils.c save_to_file.c
+
+.PHONY: winclang
+winclang: 
+	clang -march=native -DLLAMAC_AVX2 -ffinite-loops -fopenmp -DCOMPILER=\"CLANG\" -D_CRT_SECURE_NO_WARNINGS   -Ofast -fno-math-errno -D_WIN32 -o run.exe -I. -xc run.c win.c base64_utils.c save_to_file.c
+	
+.PHONY: wingccavx
+wingccavx: 
+	gcc -march=native -DLLAMAC_AVX2 -finline-small-functions -fexpensive-optimizations -ffinite-loops -funroll-all-loops -fopenmp -DCOMPILER=\"GCC\" -Ofast -fno-math-errno -D_WIN32 -o rungccavx.exe -I. -xc  run.c win.c base64_utils.c save_to_file.c
+
+.PHONY: wingcc
+wingcc: 
+	gcc -march=native -finline-small-functions -fexpensive-optimizations -ffinite-loops -funroll-all-loops -fopenmp -DCOMPILER=\"GCC\" -Ofast -fno-math-errno -D_WIN32 -o rungcc.exe -I. -xc run.c win.c base64_utils.c save_to_file.c
+
+.PHONY: winzig
+winzig: 
+	c:\zig\zig cc -Doptimize=ReleaseFast  -march=native -ffinite-loops -DCOMPILER=\"ZIG\" -Ofast -fno-math-errno -D_WIN32 -o runzig.exe -I. -xc  run.c win.c base64_utils.c save_to_file.c
+
+.PHONY: win64pgoInstrument
+win64pgoInstrument:
+	clang -march=native -ffinite-loops -fopenmp -DCOMPILER=\"CLANGpgo\" -D_CRT_SECURE_NO_WARNINGS -Ofast -fno-math-errno -D_WIN32 -fprofile-instr-generate -o run_instrumented.exe -I. run.c win_clang.c base64_utils.c save_to_file.c
+	powershell -ExecutionPolicy Bypass -Command { $path = (Get-Location).Path; Write-Host 'Executing in path:' $path; Set-Location -Path $path; $profileFile = Join-Path $path 'default.profraw'; $env:LLVM_PROFILE_FILE = $profileFile; Write-Host 'Using profile file:' $profileFile; .\sample_15.ps1 1 'run_instrumented'; }
+
+.PHONY: win64pgoBuild
+win64pgoBuild:
+	llvm-profdata merge -sparse default.profraw -o .\default.profdata
+	
+	clang -march=native -ffinite-loops -fopenmp -DCOMPILER=\"CLANGpgo\" -D_CRT_SECURE_NO_WARNINGS -Ofast -fno-math-errno -D_WIN32 -fprofile-instr-use=.\default.profdata -o runpgo.exe -I. run.c win.c base64_utils.c save_to_file.c
+
+.PHONY: win64pgo
+win64pgo:
+	make win64pgoInstrument
+	make win64pgoBuild
+
+.PHONY: winall
+winall:
+	@echo "Creating windows variants"
+	make allwin
+
+.PHONY: allwin
+allwin:
+	make wingcc
+	make winclang
+	make winmingw
+	build_msvc.bat

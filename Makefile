@@ -1,9 +1,9 @@
+# provide optional extensions to make
+-include Makefile.local
+
 # choose your compiler, e.g. gcc/clang
 # example override to clang: make run CC=clang
 CC = gcc
-
-# provide optional extensions to make
--include Makefile.local
 
 # the most basic way of building that is most likely to work on most systems
 .PHONY: run
@@ -47,6 +47,16 @@ rungnu:
 .PHONY: runompgnu
 runompgnu:
 	$(CC) -Ofast -fopenmp -std=gnu11 run.c  -lm  -o run
+
+# run all tests
+.PHONY: test
+test:
+	pytest
+
+# run only tests for run.c C implementation (is a bit faster if only C code changed)
+.PHONY: testc
+testc:
+	pytest -k runc
 
 .PHONY: clean
 clean:

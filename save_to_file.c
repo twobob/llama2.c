@@ -44,14 +44,28 @@ void initialize_file_saving(char *timestamp, char *tokens_so_far, FILE **output_
     *timelog_file = NULL; // Declare 
 }
 
+const char* MorK(const char *path) {
+    // Find the last dot
+    char *last_dot = strrchr(path, '.');
+
+    // If the character before the last dot is 'M', 'm', 'K', or 'k', return it
+    if (last_dot && (last_dot[-1] == 'M' || last_dot[-1] == 'm' || last_dot[-1] == 'K' || last_dot[-1] == 'k')) {
+        static char result[2] = {0};  // static because we return a pointer to it
+        result[0] = last_dot[-1];
+        return result;
+    }
+
+    // Otherwise, return an empty string
+    return "";
+}
 
 
-void handle_log_file(int saveLogBool, int groupLogBool, const char *dirname, const char *compiler_name, int checkpoint, char *time_log, FILE **timelog_file) {
+void handle_log_file(int saveLogBool, int groupLogBool, const char *dirname, const char *compiler_name, const char *mork,  int checkpoint, char *time_log, FILE **timelog_file) {
     if (saveLogBool && !*timelog_file) {
         if (!groupLogBool) {
-            snprintf(time_log, MAX_FILENAME_LENGTH, "%s/%s_%iM_timelog.csv", dirname, compiler_name, checkpoint);
+            snprintf(time_log, MAX_FILENAME_LENGTH, "%s/%s_%i%s_timelog.csv", dirname, compiler_name, checkpoint,mork);
         } else {
-            snprintf(time_log, MAX_FILENAME_LENGTH, "%s/All_%iM_timelog.csv", dirname, checkpoint);
+            snprintf(time_log, MAX_FILENAME_LENGTH, "%s/All_%i%s_timelog.csv", dirname, checkpoint, mork);
         }
 
         *timelog_file = fopen(time_log, "a");

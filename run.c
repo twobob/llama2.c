@@ -1,17 +1,10 @@
-/*
-Inference for Llama-2 Transformer model in pure C.
-
-Example compile: (see README for more details)
-$ gcc -O3 -o run run.c -lm
-
-Then run with:
-$ ./run
-*/
+/* Inference for Llama-2 Transformer model in pure C */
 
 #include "base64_utils.h"
 #include "save_to_file.h"
 #include <stdio.h>
 #include <stdlib.h>
+#include <ctype.h>
 #include <time.h>
 #include <fcntl.h> // For O_RDONLY
 #include <math.h>
@@ -20,6 +13,8 @@ $ ./run
 #if defined _WIN32
     #include "win.h"
 	#include <io.h>
+	#define open _open
+	#define close _close
 #else
     #include <unistd.h>
     #include <sys/mman.h>
@@ -27,6 +22,7 @@ $ ./run
 #endif
 // ----------------------------------------------------------------------------
 // Transformer and RunState structs, and related memory management
+
 typedef struct {
     int dim; // transformer dimension
     int hidden_dim; // for ffn layers
@@ -86,19 +82,20 @@ typedef struct {
 
 void malloc_run_state(RunState* s, Config* p) {
     // we calloc instead of malloc to keep valgrind happy
+    int kv_dim = (p->dim * p->n_kv_heads) / p->n_heads;
     s->x = calloc(p->dim, sizeof(float));
     s->xb = calloc(p->dim, sizeof(float));
     s->xb2 = calloc(p->dim, sizeof(float));
     s->hb = calloc(p->hidden_dim, sizeof(float));
     s->hb2 = calloc(p->hidden_dim, sizeof(float));
     s->q = calloc(p->dim, sizeof(float));
-    s->k = calloc(p->dim, sizeof(float));
-    s->v = calloc(p->dim, sizeof(float));
+    s->k = calloc(kv_dim, sizeof(float));
+    s->v = calloc(kv_dim, sizeof(float));
     s->att = calloc(p->n_heads * p->seq_len, sizeof(float));
     s->logits = calloc(p->vocab_size, sizeof(float));
     s->probindex = calloc(p->vocab_size, sizeof(ProbIndex));
-    s->key_cache = calloc(p->n_layers * p->seq_len * p->dim, sizeof(float));
-    s->value_cache = calloc(p->n_layers * p->seq_len * p->dim, sizeof(float));
+    s->key_cache = calloc(p->n_layers * p->seq_len * kv_dim, sizeof(float));
+    s->value_cache = calloc(p->n_layers * p->seq_len * kv_dim, sizeof(float));
     // ensure all mallocs went fine
     if (!s->x || !s->xb || !s->xb2 || !s->hb || !s->hb2 || !s->q 
      || !s->k || !s->v || !s->att || !s->logits || !s->key_cache 
@@ -127,20 +124,20 @@ void free_run_state(RunState* s) {
 // ----------------------------------------------------------------------------
 // initialization: read from checkpoint
 
-void checkpoint_init_weights(TransformerWeights *w, Config* p, float* f, int shared_weights) {
-    float* ptr = f;
+void checkpoint_init_weights(TransformerWeights *w, Config* p, float* ptr, int shared_weights) {
+    int head_size = p->dim / p->n_heads;
     w->token_embedding_table = ptr;
     ptr += p->vocab_size * p->dim;
     w->rms_att_weight = ptr;
     ptr += p->n_layers * p->dim;
     w->wq = ptr;
-    ptr += p->n_layers * p->dim * p->dim;
+    ptr += p->n_layers * p->dim * (p->n_heads * head_size);
     w->wk = ptr;
-    ptr += p->n_layers * p->dim * p->dim;
+    ptr += p->n_layers * p->dim * (p->n_kv_heads * head_size);
     w->wv = ptr;
-    ptr += p->n_layers * p->dim * p->dim;
+    ptr += p->n_layers * p->dim * (p->n_kv_heads * head_size);
     w->wo = ptr;
-    ptr += p->n_layers * p->dim * p->dim;
+    ptr += p->n_layers * (p->n_heads * head_size) * p->dim;
     w->rms_ffn_weight = ptr;
     ptr += p->n_layers * p->dim;
     w->w1 = ptr;
@@ -152,7 +149,6 @@ void checkpoint_init_weights(TransformerWeights *w, Config* p, float* f, int sha
     w->rms_final_weight = ptr;
     ptr += p->dim;
     w->freq_cis_real = ptr;
-    int head_size = p->dim / p->n_heads;
     ptr += p->seq_len * head_size / 2;
     w->freq_cis_imag = ptr;
     ptr += p->seq_len * head_size / 2;
@@ -161,12 +157,6 @@ void checkpoint_init_weights(TransformerWeights *w, Config* p, float* f, int sha
 
 // ----------------------------------------------------------------------------
 // neural net blocks
-
-void accum(float *a, float *b, int size) {
-    for (int i = 0; i < size; i++) {
-        a[i] += b[i];
-    }
-}
 
 void rmsnorm(float* o, float* x, float* weight, int size) {
     // calculate sum of squares
@@ -222,6 +212,8 @@ void transformer(int token, int pos, Config* p, RunState* s, TransformerWeights*
     // a few convenience variables
     float *x = s->x;
     int dim = p->dim;
+    int kv_dim = (p->dim * p->n_kv_heads) / p->n_heads;
+    int kv_mul = p->n_heads / p->n_kv_heads; // integer multiplier of the kv sharing in multiquery
     int hidden_dim =  p->hidden_dim;
     int head_size = dim / p->n_heads;
 
@@ -241,49 +233,29 @@ void transformer(int token, int pos, Config* p, RunState* s, TransformerWeights*
 
         // qkv matmuls for this position
         matmul(s->q, s->xb, w->wq + l*dim*dim, dim, dim);
-        matmul(s->k, s->xb, w->wk + l*dim*dim, dim, dim);
-        matmul(s->v, s->xb, w->wv + l*dim*dim, dim, dim);
+        matmul(s->k, s->xb, w->wk + l*dim*kv_dim, dim, kv_dim);
+        matmul(s->v, s->xb, w->wv + l*dim*kv_dim, dim, kv_dim);
 
         // apply RoPE rotation to the q and k vectors for each head
-        //for (int h = 0; h < p->n_heads; h++) {
-        //    // get the q and k vectors for this head
-        //    float* q = s->q + h * head_size;
-        //    float* k = s->k + h * head_size;
-        //    // rotate q and k by the freq_cis_real and freq_cis_imag
-        //    for (int i = 0; i < head_size; i+=2) {
-        //        float q0 = q[i];
-        //        float q1 = q[i+1];
-        //        float k0 = k[i];
-        //        float k1 = k[i+1];
-        //        float fcr = freq_cis_real_row[i/2];
-        //        float fci = freq_cis_imag_row[i/2];
-        //        q[i]   = q0 * fcr - q1 * fci;
-        //        q[i+1] = q0 * fci + q1 * fcr;
-        //        k[i]   = k0 * fcr - k1 * fci;
-        //        k[i+1] = k0 * fci + k1 * fcr;
-        //    }
-        //}
-        
-// RoPE relative positional encoding: complex-valued rotate q and k by freq_cis in each head
-        for (int i = 0; i < dim; i+=2) {
-            float q0 = s->q[i];
-            float q1 = s->q[i+1];
-            float k0 = s->k[i];
-            float k1 = s->k[i+1];
+        for (int v = 0; v < 2; v++) {
+            float* vec   = v == 0 ? s->q : s->k;    // the vector to rotate (query or key)
+            int vec_size = v == 0 ? dim  : kv_dim;  // the size of the vector
+            for (int i = 0; i < vec_size; i+=2) {
+                float v0 = vec[i];
+                float v1 = vec[i+1];
             float fcr = freq_cis_real_row[(i % head_size) / 2];
             float fci = freq_cis_imag_row[(i % head_size) / 2];
-            s->q[i]   = q0 * fcr - q1 * fci;
-            s->q[i+1] = q0 * fci + q1 * fcr;
-            s->k[i]   = k0 * fcr - k1 * fci;
-            s->k[i+1] = k0 * fci + k1 * fcr;
+                vec[i]   = v0 * fcr - v1 * fci;
+                vec[i+1] = v0 * fci + v1 * fcr;
+            }
         }
 
         // save key,value at this time step (pos) to our kv cache
-        int loff = l * p->seq_len * dim; // kv cache layer offset for convenience
-        float* key_cache_row = s->key_cache + loff + pos * dim;
-        float* value_cache_row = s->value_cache + loff + pos * dim;
-        memcpy(key_cache_row, s->k, dim*sizeof(*key_cache_row));
-        memcpy(value_cache_row, s->v, dim*sizeof(*value_cache_row));
+        int loff = l * p->seq_len * kv_dim; // kv cache layer offset for convenience
+        float* key_cache_row = s->key_cache + loff + pos * kv_dim;
+        float* value_cache_row = s->value_cache + loff + pos * kv_dim;
+        memcpy(key_cache_row, s->k, kv_dim * sizeof(*key_cache_row));
+        memcpy(value_cache_row, s->v, kv_dim * sizeof(*value_cache_row));
         
         // multihead attention. iterate over all heads
         int h;
@@ -296,7 +268,7 @@ void transformer(int token, int pos, Config* p, RunState* s, TransformerWeights*
             // iterate over all timesteps, including the current one
             for (int t = 0; t <= pos; t++) {
                 // get the key vector for this head and at this timestep
-                float* k = s->key_cache + loff + t * dim + h * head_size;
+                float* k = s->key_cache + loff + t * kv_dim + (h / kv_mul) * head_size;
                 // calculate the attention score as the dot product of q and k
                 float score = 0.0f;
                 for (int i = 0; i < head_size; i++) {
@@ -315,7 +287,7 @@ void transformer(int token, int pos, Config* p, RunState* s, TransformerWeights*
             memset(xb, 0, head_size * sizeof(float));
             for (int t = 0; t <= pos; t++) {
                 // get the value vector for this head and at this timestep
-                float* v = s->value_cache + loff + t * dim + h * head_size;
+                float* v = s->value_cache + loff + t * kv_dim + (h / kv_mul) * head_size;
                 // get the attention weight for this timestep
                 float a = att[t];
                 // accumulate the weighted value into xb
@@ -329,7 +301,9 @@ void transformer(int token, int pos, Config* p, RunState* s, TransformerWeights*
         matmul(s->xb2, s->xb, w->wo + l*dim*dim, dim, dim);
 
         // residual connection back into x
-        accum(x, s->xb2, dim);
+        for (int i = 0; i < dim; i++) {
+            x[i] += s->xb2[i];
+        }
 
         // ffn rmsnorm
         rmsnorm(s->xb, x, w->rms_ffn_weight + l*dim, dim);
@@ -353,7 +327,9 @@ void transformer(int token, int pos, Config* p, RunState* s, TransformerWeights*
         matmul(s->xb, s->hb, w->w2 + l*dim*hidden_dim, hidden_dim, dim);
 
         // residual connection
-        accum(x, s->xb, dim);
+        for (int i = 0; i < dim; i++) {
+            x[i] += s->xb[i];
+        }
     }
     
     // final rmsnorm
@@ -366,29 +342,85 @@ void transformer(int token, int pos, Config* p, RunState* s, TransformerWeights*
 // ----------------------------------------------------------------------------
 // byte pair encoding (BPE) tokenizer, encodes strings into tokens so we can prompt
 
-int str_lookup(char *str, char **vocab, int vocab_size) {
+typedef struct {
+    char *str;
+    int id;
+} TokenIndex;
     // find the first perfect match for str in vocab, return its index or -1 if not found
-    for (int i = 0; i < vocab_size; i++) {
-        if (strcmp(str, vocab[i]) == 0) {
-            return i;
+int compare_tokens(const void *a, const void *b) {
+    return strcmp(((TokenIndex*)a)->str, ((TokenIndex*)b)->str);
         }
-    }
-    return -1;
+
+int str_lookup(char *str, TokenIndex *sorted_vocab, int vocab_size) {
+    // efficiently find the perfect match for str in vocab, return its index or -1 if not found
+    TokenIndex tok = { .str = str }; // acts as the key to search for
+    TokenIndex *res = bsearch(&tok, sorted_vocab, vocab_size, sizeof(TokenIndex), compare_tokens);
+    return res != NULL ? res->id : -1;
 }
 
 void bpe_encode(char *text, char **vocab, float *vocab_scores, int vocab_size, unsigned int max_token_length, int *tokens, int *n_tokens) {
+
+    // sort vocabulary
+    TokenIndex *sorted_vocab = malloc(vocab_size * sizeof(TokenIndex));
+    for (int i = 0; i < vocab_size; i++) {
+        sorted_vocab[i].str = vocab[i];
+        sorted_vocab[i].id = i;
+    }
+    qsort(sorted_vocab, vocab_size, sizeof(TokenIndex), compare_tokens);
     
     // a temporary buffer to merge two consecutive tokens
     char* str_buffer = malloc((max_token_length*2+1) * sizeof(char)); // *2 for concat, +1 for null terminator
+    size_t str_len = 0;
 
     // first encode every individual byte in the input string
-    *n_tokens = 0; // the number of tokens
+    tokens[0] = str_lookup(" ", sorted_vocab, vocab_size);
+    *n_tokens = 1; // the number of tokens
+
+    // Okay UTF-8 time. This will get messy. Here is the reference from Wikipedia:
+    // Code point ↔ UTF-8 conversion
+    // First code point	Last code point	Byte 1	Byte 2	Byte 3	Byte 4
+    // U+0000	U+007F	    0xxxxxxx
+    // U+0080	U+07FF	    110xxxxx	10xxxxxx
+    // U+0800	U+FFFF	    1110xxxx	10xxxxxx	10xxxxxx
+    // U+10000	U+10FFFF    11110xxx	10xxxxxx	10xxxxxx	10xxxxxx
+
+    // process the raw (UTF-8) byte sequence of the input string
     for (char *c = text; *c != '\0'; c++) {
-        sprintf(str_buffer, "%c", *c);
-        int id = str_lookup(str_buffer, vocab, vocab_size);
-        if (id == -1) { fprintf(stderr, "not good\n"); exit(EXIT_FAILURE); }
-        tokens[*n_tokens] = id;
-        (*n_tokens)++;
+
+        // reset buffer if the current byte is ASCII or a leading byte
+        // 0xC0 is 11000000, so (*c & 0xC0) keeps the first 2 bits and zeros the rest
+        // 0x80 is 10000000
+        // in UTF-8, all continuation bytes start with "10" in first two bits
+        // so in English this is: "if this byte is not a continuation byte"
+        if ((*c & 0xC0) != 0x80) {
+            // this byte must be either a leading byte (11...) or an ASCII char (0x...)
+            // => reset our location, as we're starting a new UTF-8 codepoint
+            str_len = 0;
+        }
+
+        // append the current byte to the buffer
+        str_buffer[str_len++] = *c; // ++ is post-increment, incremented after this line
+        str_buffer[str_len] = '\0';
+
+        // while the next character is a continuation byte, continue appending
+        if ((*(c+1) & 0xC0) == 0x80) {
+            continue;
+        }
+
+        // ok c+1 is not a continuation byte, so we've read in a full codepoint
+        int id = str_lookup(str_buffer, sorted_vocab, vocab_size);
+
+        if (id != -1) {
+            // we found this codepoint in vocab, add it as a token
+            tokens[(*n_tokens)++] = id;
+        } else {
+            // byte_fallback encoding: just encode each byte as a token
+            // +3 is here because the first 3 vocab elements are <unk>, <s>, </s>
+            // so the individual bytes only start at index 3
+            for (int i=0; i < str_len; i++) {
+                tokens[(*n_tokens)++] = (unsigned char)str_buffer[i] + 3;
+            }
+        }
     }
 
     // merge the best consecutive pair each iteration, according the scores in vocab_scores
@@ -400,7 +432,7 @@ void bpe_encode(char *text, char **vocab, float *vocab_scores, int vocab_size, u
         for (int i=0; i < (*n_tokens-1); i++) {
             // check if we can merge the pair (tokens[i], tokens[i+1])
             sprintf(str_buffer, "%s%s", vocab[tokens[i]], vocab[tokens[i+1]]);
-            int id = str_lookup(str_buffer, vocab, vocab_size);
+            int id = str_lookup(str_buffer, sorted_vocab, vocab_size);
             if (id != -1 && vocab_scores[id] > best_score) {
                 // this merge pair exists in vocab! record its score and position
                 best_score = vocab_scores[id];
@@ -423,6 +455,7 @@ void bpe_encode(char *text, char **vocab, float *vocab_scores, int vocab_size, u
     }
 
     free(str_buffer);
+    free(sorted_vocab);
 }
 
 // ----------------------------------------------------------------------------
@@ -489,17 +522,24 @@ int sample_topp(float* probabilities, int n, float topp, ProbIndex* probindex) {
     // tokens that exceed probability topp. This way we never sample tokens that
     // have very low probabilities and are less likely to go "off the rails".
 
+    int n0 = 0;
     // quicksort indices in descending order of probabilities
+    // values smaller than (1 - topp) / (n - 1) cannot be part of the result
+    // so for efficiency we crop these out as candidates before sorting
+    const float cutoff = (1.0f - topp) / (n - 1);
     for (int i = 0; i < n; i++) {
-        probindex[i].index = i;
-        probindex[i].prob = probabilities[i];
+        if (probabilities[i] >= cutoff) {
+            probindex[n0].index = i;
+            probindex[n0].prob = probabilities[i];
+            n0++;
         }
-    qsort(probindex, n, sizeof(ProbIndex), compare);
+    }
+    qsort(probindex, n0, sizeof(ProbIndex), compare);
 
     // truncate the list where cumulative probability exceeds topp
     float cumulative_prob = 0.0f;
-    int last_idx = 0;
-    for (int i = 0; i < n; i++) {
+    int last_idx = n0 - 1; // in case of rounding errors consider all elements
+    for (int i = 0; i < n0; i++) {
         cumulative_prob += probindex[i].prob;
         if (cumulative_prob > topp) {
             last_idx = i;
@@ -528,17 +568,17 @@ void error_usage() {
     fprintf(stderr, "Example: run model.bin -n 256 -i \"Once upon a time\"\n");
     fprintf(stderr, "Options:\n");
     fprintf(stderr, "  -t <float>  temperature, default 1.0\n");
-    fprintf(stderr, "  -p <float>  p value in top-p (nucleus) sampling. default 1.0 (=off)\n");
+    fprintf(stderr, "  -p <float>  p value in top-p (nucleus) sampling. default 0.9\n");
     fprintf(stderr, "  -s <int>    random seed, default time(NULL)\n");
     fprintf(stderr, "  -n <int>    number of steps to run for, default 256. 0 = max_seq_len\n");
-    fprintf(stderr, "  -i <string> prompt string, default none\n");
-    fprintf(stderr, "  -p <float>  p value in top-p (nucleus) sampling. default 0.9, 0 = off\n");
-    fprintf(stderr, "  -k <int> print_tokens, 1 or 0 flag default 1\n");
-    fprintf(stderr, "  -f <int> saveFileBool, 1 or 0 flag default 1\n");
-    fprintf(stderr, "  -l <int> saveLogBool, 1 or 0 flag saves timestamps for tokens gen default 0\n");
+    fprintf(stderr, "  -i <string> input prompt\n");
+    fprintf(stderr, "  -z <string> optional path to custom tokenizer\n");
+	fprintf(stderr, "  -k <int> print_tokens, 1 or 0 flag default 1\n");
+	fprintf(stderr, "  -f <int> saveFileBool, 1 or 0 flag default 1\n");
+	fprintf(stderr, "  -l <int> saveLogBool, 1 or 0 flag saves timestamps for tokens gen default 0\n");
 	fprintf(stderr, "  -g <int> groupLogBool, 1 or 0 flag group output by compiler default 0\n");
-    fprintf(stderr, "  -b <int> singleBOS, 1 or 0 flag default 1\n");
-    fprintf(stderr, "  -d <string> dirname string, default none\n");
+	fprintf(stderr, "  -b <int> singleBOS, 1 or 0 flag default 1\n");
+	fprintf(stderr, "  -d <string> dirname string, default none\n");
     exit(EXIT_FAILURE);
 }
 
@@ -546,8 +586,9 @@ int main(int argc, char *argv[]) {
 
     // poor man's C argparse
     char *checkpoint = NULL;  // e.g. out/model.bin
+    char *tokenizer = "tokenizer.bin";
     float temperature = 1.0f; // 0.0 = greedy deterministic. 1.0 = original. don't set higher
-    float topp = 1.0f;        // top-p in nucleus sampling. 1.0 = off. 0.9 works well, but slower
+    float topp = 0.9f;        // top-p in nucleus sampling. 1.0 = off. 0.9 works well, but slower
     rng_seed = 0; // seed rng with time by default
     int steps = 256;          // max number of steps to run for, 0: use seq_len
     char *prompt = NULL;         // prompt string
@@ -572,12 +613,13 @@ int main(int argc, char *argv[]) {
         else if (argv[i][1] == 's') { rng_seed = atoi(argv[i + 1]); }
         else if (argv[i][1] == 'n') { steps = atoi(argv[i + 1]); }
         else if (argv[i][1] == 'i') { prompt = argv[i + 1]; }
-	else if (argv[i][1] == 'k') { print_tokens = atoi( argv[i + 1]); }
-	else if (argv[i][1] == 'f') { saveFileBool = atoi( argv[i + 1]); }
-	else if (argv[i][1] == 'l') { saveLogBool = atoi( argv[i + 1]); }
-	else if (argv[i][1] == 'g') { groupLogBool = atoi( argv[i + 1]); }
-	else if (argv[i][1] == 'b') { singleBOS = atoi( argv[i + 1]); }
-        else if (argv[i][1] == 'd') { dirname = argv[i + 1]; }
+        else if (argv[i][1] == 'z') { tokenizer = argv[i + 1]; }
+		else if (argv[i][1] == 'k') { print_tokens = atoi( argv[i + 1]); }
+		else if (argv[i][1] == 'f') { saveFileBool = atoi( argv[i + 1]); }
+		else if (argv[i][1] == 'l') { saveLogBool = atoi( argv[i + 1]); }
+		else if (argv[i][1] == 'g') { groupLogBool = atoi( argv[i + 1]); }
+		else if (argv[i][1] == 'b') { singleBOS = atoi( argv[i + 1]); }
+		else if (argv[i][1] == 'd') { dirname = argv[i + 1]; }
         else { error_usage(); }
     }
     if(rng_seed == 0) { rng_seed =  (unsigned int)time(NULL);}
@@ -592,13 +634,19 @@ int main(int argc, char *argv[]) {
 	char time_log[MAX_STRING_SIZE];
 
 	initialize_file_saving(timestamp, tokens_so_far, &output_file, &timelog_file, time_log);
+    // for saving files
+	    if (create_directory(dirname) != 0) {
+		return 1;
+	    }
+ 	handle_log_file(saveLogBool, groupLogBool, dirname, COMPILER,  MorK(checkpoint), extractNumber(checkpoint), time_log, &timelog_file);
+   
 
-    // read in the model.bin file
+   // read in the model.bin file
     Config config;
     TransformerWeights weights;
     int fd = 0;         // file descriptor for memory mapping
     float* data = NULL; // memory mapped data pointer
-    long file_size;     // size of the checkpoint file in bytes
+    ssize_t file_size;     // size of the checkpoint file in bytes
     {
         FILE *file = fopen(checkpoint, "rb");
         if (!file) { fprintf(stderr, "Couldn't open file %s\n", checkpoint); return 1; }
@@ -612,7 +660,7 @@ int main(int argc, char *argv[]) {
         file_size = ftell(file); // get the file size, in bytes
         fclose(file);
         // memory map the Transformer weights into the data pointer
-		fd = _open(checkpoint, O_RDONLY); // Open in read-only mode
+        fd = open(checkpoint, O_RDONLY); // open in read only mode
         if (fd == -1) { fprintf(stderr, "open failed!\n"); return 1; }
         data = mmap(NULL, file_size, PROT_READ, MAP_PRIVATE, fd, 0);
         if (data == MAP_FAILED) { fprintf(stderr, "mmap failed!\n"); return 1; }
@@ -627,8 +675,8 @@ int main(int argc, char *argv[]) {
     float* vocab_scores = (float*)malloc(config.vocab_size * sizeof(float));
     unsigned int max_token_length;
     {
-        FILE *file = fopen("tokenizer.bin", "rb");
-        if (!file) { fprintf(stderr, "couldn't load tokenizer.bin\n"); return 1; }
+        FILE *file = fopen(tokenizer, "rb");
+        if (!file) { fprintf(stderr, "couldn't load %s\n", tokenizer); return 1; }
         if (fread(&max_token_length, sizeof(int), 1, file) != 1) { fprintf(stderr, "failed read\n"); return 1; }
         int len;
         for (int i = 0; i < config.vocab_size; i++) {
@@ -649,32 +697,15 @@ int main(int argc, char *argv[]) {
     int *prompt_tokens = NULL;
     int num_prompt_tokens = 0;
     if (prompt != NULL) {
-        prompt_tokens = (int*)malloc(strlen(prompt) * sizeof(int));
+        prompt_tokens = (int*)malloc((strlen(prompt)+1) * sizeof(int));
         bpe_encode(prompt, vocab, vocab_scores, config.vocab_size, max_token_length, prompt_tokens, &num_prompt_tokens);
     }
-
-    // for saving files
-    if (create_directory(dirname) != 0) {
-        return 1;
-    }
-    
 
     // start the main loop
     long start = 0;  // used to time our code, only initialized after first iteration
     int next;        // will store the next token in the sequence
     int token = 1;   // init with token 1 (=BOS), as done in Llama-2 sentencepiece tokenizer
     int pos = 0;     // position in the sequence
-	if (topp < 1.0) {fprintf(stderr, "using topp\n");} 
-    if (print_tokens > 0) {fprintf(stderr, "<s>\n");} // explicit print the initial BOS token for stylistic symmetry reasons
-
-    //handle_log_file(saveLogBool, groupLogBool, dirname, COMPILER, extractNumber(checkpoint), time_log);
-
-	handle_log_file(saveLogBool, groupLogBool, dirname, COMPILER, extractNumber(checkpoint), time_log, &timelog_file);
-
-
-
-  // Now run the loop
-
     while (pos < steps) {
 
         // forward the transformer to get logits for the next token
@@ -708,30 +739,44 @@ int main(int argc, char *argv[]) {
 	token = next;
         // init our timer here because the first iteration is slow due to memmap
         if (start == 0) { start = time_in_ms(); }
-	if (saveLogBool) {add_timestamp_to_log_buffer(time_in_ms(), timelog_file);}	
+
 
  // following BOS token (1), sentencepiece decoder strips any leading whitespace (see PR #89)
         char *token_str = (token == 1 && vocab[next][0] == ' ') ? vocab[next]+1 : vocab[next];
 		
-		token_str = replaceDoubleQuotesWithFullwidth(token_str);
-		
-		stripNewlines(token_str);
-        if (print_tokens > 0) {fprintf(stderr, "%s", token_str);}
-		if(saveFileBool > 0 ){
+        if (print_tokens > 0) {
+		unsigned char byte_val;
+		if (sscanf(token_str, "<0x%02hhX>", &byte_val) == 1) {
+		    // ok this token is a raw byte token, carefuly to only print printable chars or whitespace
+		    // some of the other bytes can be various control codes, backspace, etc. => skip
+		    if (isprint(byte_val) || isspace(byte_val)) {
+		        char byte_piece[2];
+		        byte_piece[0] = byte_val;
+		        byte_piece[1] = '\0';
+		        printf("%s", byte_piece);
+		    }
+		}
+		else {	stripNewlines(token_str);
+			token_str = replaceDoubleQuotesWithFullwidth(token_str);
+			fprintf(stderr, "%s", token_str);
+			fflush(stdout);
+			}
+	}
+	
+
+	if(saveFileBool > 0 ){
 
 			strcat_s(tokens_so_far, MAX_STRING_SIZE, token_str);
 		}
 
-        if (print_tokens > 0) {fflush(stdout);} 
+        // init the timer here because the first iteration can be slower
+        if (start == 0) { start = time_in_ms(); }
+	if (saveLogBool) {add_timestamp_to_log_buffer(time_in_ms(), timelog_file);}	
 	if (next == 1 && singleBOS > 0)  {
-
-
-
 		break;
 		}
-		
-        }
-
+	}
+printf("\n");
 	save_prompt_to_file(saveFileBool, prompt, dirname, timestamp, tokens_so_far);
 
 	finalize_log_file(saveLogBool, timelog_file);
@@ -755,6 +800,6 @@ int main(int argc, char *argv[]) {
     fclose(output_file);
     if (prompt_tokens != NULL) free(prompt_tokens);
     if (data != MAP_FAILED) munmap(data, file_size);
-    if (fd != -1) _close(fd); // Close the file descriptor
+    if (fd != -1) close(fd);
     return 0;
 }
