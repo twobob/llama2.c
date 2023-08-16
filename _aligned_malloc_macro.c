@@ -10,9 +10,10 @@
     #include <fcntl.h>
     #include <direct.h>
     #include <windows.h>
-    #define FILE_OPEN(path, mode) _open(path, mode)
-    #define FILE_CLOSE(fd) _close(fd)
-    #define FILE_STAT(fd, statStruct) _fstat(fd, statStruct)
+	//winnt.h:5917: #define FILE_OPEN 0x00000001 . so avoid
+    #define _FILE_OPEN(path, mode) _open(path, mode)
+    #define _FILE_CLOSE(fd) _close(fd)
+    #define _FILE_STAT(fd, statStruct) _fstat(fd, statStruct)
     #define ALIGNED_ALLOC(alignment, size) _aligned_malloc(size, alignment)
     #define ALIGNED_FREE(ptr) _aligned_free(ptr)
     typedef struct _stat FileStat;
@@ -20,9 +21,9 @@
     #include <unistd.h>
     #include <sys/mman.h>
     #include <fcntl.h>
-    #define FILE_OPEN(path, mode) open(path, mode)
-    #define FILE_CLOSE(fd) close(fd)
-    #define FILE_STAT(fd, statStruct) fstat(fd, statStruct)
+    #define _FILE_OPEN(path, mode) open(path, mode)
+    #define _FILE_CLOSE(fd) close(fd)
+    #define _FILE_STAT(fd, statStruct) fstat(fd, statStruct)
     #define ALIGNED_ALLOC(alignment, size) aligned_alloc(alignment, size)
     #define ALIGNED_FREE(ptr) free(ptr)
     typedef struct stat FileStat;
@@ -54,25 +55,25 @@ int main(int argc, char *argv[]) {
     do {
         const char *filename = findFileData.cFileName;
 
-        if (filename[0] != '.' && filename[0] != '..') {
+        if (filename[1] != '.' && filename[0] != '.') {
             char fullPath[512];
             snprintf(fullPath, sizeof(fullPath), "%s\\%s", directory_path, filename);
 
-            int fd = FILE_OPEN(fullPath, O_RDONLY);
+            int fd = _FILE_OPEN(fullPath, O_RDONLY);
             if (fd == -1) {
                 perror("Error opening file");
                 continue;
             }
 
             FileStat fileStat;
-            FILE_STAT(fd, &fileStat);
+            _FILE_STAT(fd, &fileStat);
             int64_t fileSize = (int64_t)fileStat.st_size;
 
             float* data = (float*) ALIGNED_ALLOC(1024, fileSize);
             if (!data) {
                 fprintf(stderr, "Failed to allocate aligned memory for %s\n", filename);
                 failCount++;
-                FILE_CLOSE(fd);
+                _FILE_CLOSE(fd);
                 continue;
             }
 
@@ -85,7 +86,7 @@ int main(int argc, char *argv[]) {
             }
             printf("Attempting to free: %s data which is %lld\n", fullPath,  fileSize);
             ALIGNED_FREE(data);
-            FILE_CLOSE(fd);
+            _FILE_CLOSE(fd);
         }
     } while (FindNextFile(hFind, &findFileData) != 0);
     FindClose(hFind);
@@ -108,21 +109,21 @@ int main(int argc, char *argv[]) {
 
                 printf("Attempting to open: %s\n", fullPath);
 
-                int fd = FILE_OPEN(fullPath, O_RDONLY);
+                int fd = _FILE_OPEN(fullPath, O_RDONLY);
                 if (fd == -1) {
                     perror("Error opening file");
                     continue;
                 }
 
                 FileStat fileStat;
-                FILE_STAT(fd, &fileStat);
+                _FILE_STAT(fd, &fileStat);
                 int64_t fileSize = (int64_t)fileStat.st_size;
 
                 float* data = (float*) ALIGNED_ALLOC(1024, fileSize);
                 if (!data) {
                     fprintf(stderr, "Failed to allocate aligned memory for %s\n", filename);
                     failCount++;
-                    FILE_CLOSE(fd);
+                    _FILE_CLOSE(fd);
                     continue;
                 }
 
@@ -135,7 +136,7 @@ int main(int argc, char *argv[]) {
                 }
                 printf("Attempting to free: %s data which is %p\n", fullPath,  (void*)data);
                 ALIGNED_FREE(data);
-                FILE_CLOSE(fd);
+                _FILE_CLOSE(fd);
             }
         }
     }
