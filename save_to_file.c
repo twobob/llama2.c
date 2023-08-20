@@ -6,14 +6,14 @@
     #include <fcntl.h>
     #include "win.h"
     #include <direct.h>
-    #define ACCESS_CMD _access
-    #define MKDIR_CMD(path) _mkdir(path)
+    #define access _access
+    #define mkdir(path) _mkdir(path)
 #else
     #include <unistd.h>
     #include <sys/mman.h>
     #include <sys/stat.h>
-    #define ACCESS_CMD access
-    #define MKDIR_CMD(path) mkdir(path, 0700)
+    #define access _access
+    #define mkdir(path) mkdir(path, 0700)
 #endif
 
 #include "save_to_file.h"
@@ -137,9 +137,9 @@ void save_prompt_to_file(int saveFileBool, const char *prompt, const char *dirna
 }
 
 int create_directory(const char *dirname) {
-    if (ACCESS_CMD(dirname, 0) == -1) {
+    if (access(dirname, 0) == -1) {
         fprintf(stderr, "Directory %s does not exist. Attempting to create it.\\n", dirname);
-        if (MKDIR_CMD(dirname) == -1) {
+        if (mkdir(dirname) == -1) {
             fprintf(stderr, "Unable to create directory %s!\\n", dirname);
             return 1;
         }

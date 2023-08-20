@@ -9,7 +9,6 @@
 #include <fcntl.h> // For O_RDONLY
 #include <math.h>
 #include <string.h>
-#include <fcntl.h>
 #if defined _WIN32
     #include "win.h"
 	#include <io.h>
@@ -21,7 +20,7 @@
 	#include <sys/stat.h>
 #endif
 // ----------------------------------------------------------------------------
-// Transformer and RunState structs, and related memory management
+// Transformer and RunState structs, and related memory management 
 
 typedef struct {
     int dim; // transformer dimension
@@ -50,17 +49,9 @@ typedef struct {
     float* w3; // (layer, hidden_dim, dim)
     // final rmsnorm
     float* rms_final_weight; // (dim,)
-    // freq_cis for RoPE relatively positional embeddings
-    float* freq_cis_real; // (seq_len, dim/2)
-    float* freq_cis_imag; // (seq_len, dim/2)
     // (optional) classifier weights for the logits, on the last layer
     float* wcls;
 } TransformerWeights;
-
-typedef struct {
-    float prob;
-    int index;
-} ProbIndex; // struct used when sorting probabilities during top-p sampling
 
 typedef struct {
     // current wave of activations
@@ -74,7 +65,6 @@ typedef struct {
     float *v; // value (dim,)
     float *att; // buffer for scores/attention values (n_heads, seq_len)
     float *logits; // output logits
-    ProbIndex *probindex; // buffer used in top-p sampling
     // kv cache
     float* key_cache;   // (layer, seq_len, dim)
     float* value_cache; // (layer, seq_len, dim)
@@ -93,13 +83,12 @@ void malloc_run_state(RunState* s, Config* p) {
     s->v = calloc(kv_dim, sizeof(float));
     s->att = calloc(p->n_heads * p->seq_len, sizeof(float));
     s->logits = calloc(p->vocab_size, sizeof(float));
-    s->probindex = calloc(p->vocab_size, sizeof(ProbIndex));
     s->key_cache = calloc(p->n_layers * p->seq_len * kv_dim, sizeof(float));
     s->value_cache = calloc(p->n_layers * p->seq_len * kv_dim, sizeof(float));
     // ensure all mallocs went fine
     if (!s->x || !s->xb || !s->xb2 || !s->hb || !s->hb2 || !s->q 
      || !s->k || !s->v || !s->att || !s->logits || !s->key_cache 
-     || !s->value_cache || !s->probindex) {
+     || !s->value_cache) {
         fprintf(stderr, "malloc failed!\n");
         exit(EXIT_FAILURE);
     }
@@ -116,7 +105,6 @@ void free_run_state(RunState* s) {
     free(s->v);
     free(s->att);
     free(s->logits);
-    free(s->probindex);
     free(s->key_cache);
     free(s->value_cache);
 }
@@ -148,11 +136,31 @@ void checkpoint_init_weights(TransformerWeights *w, Config* p, float* ptr, int s
     ptr += p->n_layers * p->dim * p->hidden_dim;
     w->rms_final_weight = ptr;
     ptr += p->dim;
-    w->freq_cis_real = ptr;
     ptr += p->seq_len * head_size / 2;
-    w->freq_cis_imag = ptr;
     ptr += p->seq_len * head_size / 2;
     w->wcls = shared_weights ? w->token_embedding_table : ptr;
+}
+
+void read_checkpoint(char* checkpoint, Config* config, TransformerWeights* weights,
+                     int* fd, float** data, ssize_t* file_size) {
+    FILE *file = fopen(checkpoint, "rb");
+    if (!file) { fprintf(stderr, "Couldn't open file %s\n", checkpoint); exit(EXIT_FAILURE); }
+    // read in the config header
+    if (fread(config, sizeof(Config), 1, file) != 1) { exit(EXIT_FAILURE); }
+    // negative vocab size is hacky way of signaling unshared weights. bit yikes.
+    int shared_weights = config->vocab_size > 0 ? 1 : 0;
+    config->vocab_size = abs(config->vocab_size);
+    // figure out the file size
+    fseek(file, 0, SEEK_END); // move file pointer to end of file
+    *file_size = ftell(file); // get the file size, in bytes
+    fclose(file);
+    // memory map the Transformer weights into the data pointer
+    *fd = open(checkpoint, O_RDONLY); // open in read only mode
+    if (*fd == -1) { fprintf(stderr, "open failed!\n"); exit(EXIT_FAILURE); }
+    *data = mmap(NULL, *file_size, PROT_READ, MAP_PRIVATE, *fd, 0);
+    if (*data == MAP_FAILED) { fprintf(stderr, "mmap failed!\n"); exit(EXIT_FAILURE); }
+    float* weights_ptr = *data + sizeof(Config)/sizeof(float);
+    checkpoint_init_weights(weights, config, weights_ptr, shared_weights);
 }
 
 // ----------------------------------------------------------------------------
@@ -221,10 +229,6 @@ void transformer(int token, int pos, Config* p, RunState* s, TransformerWeights*
     float* content_row = &(w->token_embedding_table[token * dim]);
     memcpy(x, content_row, dim*sizeof(*x));
 
-    // pluck out the "pos" row of freq_cis_real and freq_cis_imag
-    float* freq_cis_real_row = w->freq_cis_real + pos * head_size / 2;
-    float* freq_cis_imag_row = w->freq_cis_imag + pos * head_size / 2;
-
     // forward all the layers
     for(int l = 0; l < p->n_layers; l++) {
 
@@ -236,15 +240,18 @@ void transformer(int token, int pos, Config* p, RunState* s, TransformerWeights*
         matmul(s->k, s->xb, w->wk + l*dim*kv_dim, dim, kv_dim);
         matmul(s->v, s->xb, w->wv + l*dim*kv_dim, dim, kv_dim);
 
-        // apply RoPE rotation to the q and k vectors for each head
-        for (int v = 0; v < 2; v++) {
-            float* vec   = v == 0 ? s->q : s->k;    // the vector to rotate (query or key)
-            int vec_size = v == 0 ? dim  : kv_dim;  // the size of the vector
-            for (int i = 0; i < vec_size; i+=2) {
+
+        for (int i = 0; i < dim; i+=2) {
+            int head_dim = i % head_size;
+            float freq = 1.0f / powf(10000.0f, head_dim / (float)head_size);
+            float val = pos * freq;
+            float fcr = cosf(val);
+            float fci = sinf(val);
+            int rotn = i < kv_dim ? 2 : 1; // how many vectors? 2 = q & k, 1 = q only
+            for (int v = 0; v < rotn; v++) {
+                float* vec = v == 0 ? s->q : s->k; // the vector to rotate (query or key)
                 float v0 = vec[i];
                 float v1 = vec[i+1];
-            float fcr = freq_cis_real_row[(i % head_size) / 2];
-            float fci = freq_cis_imag_row[(i % head_size) / 2];
                 vec[i]   = v0 * fcr - v1 * fci;
                 vec[i+1] = v0 * fci + v1 * fcr;
             }
@@ -343,6 +350,61 @@ void transformer(int token, int pos, Config* p, RunState* s, TransformerWeights*
 // byte pair encoding (BPE) tokenizer, encodes strings into tokens so we can prompt
 
 typedef struct {
+    char** vocab;
+    float* vocab_scores;
+    int vocab_size;
+    unsigned int max_token_length;
+    char byte_piece[2];
+} Tokenizer;
+
+void build_tokenizer(char* tokenizer, Tokenizer* t, int vocab_size) {
+    // i should have written the vocab_size into the tokenizer file... sigh
+    t->vocab_size = vocab_size;
+    // malloc space to hold the scores and the strings
+    t->vocab = (char**)malloc(vocab_size * sizeof(char*));
+    t->vocab_scores = (float*)malloc(vocab_size * sizeof(float));
+    t->byte_piece[1] = '\0'; // null terminate the byte_piece string
+    // read in the file
+    FILE *file = fopen(tokenizer, "rb");
+    if (!file) { fprintf(stderr, "couldn't load %s\n", tokenizer); exit(EXIT_FAILURE); }
+    if (fread(&t->max_token_length, sizeof(int), 1, file) != 1) { fprintf(stderr, "failed read\n"); exit(EXIT_FAILURE); }
+    int len;
+    for (int i = 0; i < vocab_size; i++) {
+        if (fread(t->vocab_scores + i, sizeof(float), 1, file) != 1) { fprintf(stderr, "failed read\n"); exit(EXIT_FAILURE);}
+        if (fread(&len, sizeof(int), 1, file) != 1) { fprintf(stderr, "failed read\n"); exit(EXIT_FAILURE); }
+        t->vocab[i] = (char *)malloc(len + 1);
+        if (fread(t->vocab[i], len, 1, file) != 1) { fprintf(stderr, "failed read\n"); exit(EXIT_FAILURE); }
+        t->vocab[i][len] = '\0'; // add the string terminating token
+    }
+    fclose(file);
+}
+
+void free_tokenizer(Tokenizer* t) {
+    for (int i = 0; i < t->vocab_size; i++) {
+        free(t->vocab[i]);
+    }
+    free(t->vocab);
+    free(t->vocab_scores);
+}
+
+char* get_piece(Tokenizer* t, int prev_token, int token) {
+    char *piece = t->vocab[token];
+    // following BOS (1) token, sentencepiece decoder strips any leading whitespace (see PR #89)
+    if (prev_token == 1 && piece[0] == ' ') { piece++; }
+    // careful, some tokens designate raw bytes, and look like e.g. '<0x01>'
+    unsigned char byte_val;
+    if (sscanf(piece, "<0x%02hhX>", &byte_val) == 1) {
+        // ok this token is a raw byte token, careful to only print printable chars or whitespace
+        // some of the other bytes can be various control codes, backspace, etc. => skip
+        if (isprint(byte_val) || isspace(byte_val)) {
+            t->byte_piece[0] = byte_val;
+            piece = &t->byte_piece[0];
+        }
+    }
+    return piece;
+}
+
+typedef struct {
     char *str;
     int id;
 } TokenIndex;
@@ -358,22 +420,23 @@ int str_lookup(char *str, TokenIndex *sorted_vocab, int vocab_size) {
     return res != NULL ? res->id : -1;
 }
 
-void bpe_encode(char *text, char **vocab, float *vocab_scores, int vocab_size, unsigned int max_token_length, int *tokens, int *n_tokens) {
+void bpe_encode(Tokenizer* t, char *text, int *tokens, int *n_tokens) {
 
     // sort vocabulary
-    TokenIndex *sorted_vocab = malloc(vocab_size * sizeof(TokenIndex));
-    for (int i = 0; i < vocab_size; i++) {
-        sorted_vocab[i].str = vocab[i];
+    // sort vocabulary
+    TokenIndex *sorted_vocab = malloc(t->vocab_size * sizeof(TokenIndex));
+    for (int i = 0; i < t->vocab_size; i++) {
+        sorted_vocab[i].str = t->vocab[i];
         sorted_vocab[i].id = i;
     }
-    qsort(sorted_vocab, vocab_size, sizeof(TokenIndex), compare_tokens);
+    qsort(sorted_vocab, t->vocab_size, sizeof(TokenIndex), compare_tokens);
     
     // a temporary buffer to merge two consecutive tokens
-    char* str_buffer = malloc((max_token_length*2+1) * sizeof(char)); // *2 for concat, +1 for null terminator
+    char* str_buffer = malloc((t->max_token_length*2 +1 +2) * sizeof(char)); // *2 for concat, +1 for null terminator +2 for UTF8 (in case max_token_lenght is 1)
     size_t str_len = 0;
 
     // first encode every individual byte in the input string
-    tokens[0] = str_lookup(" ", sorted_vocab, vocab_size);
+    tokens[0] = str_lookup(" ", sorted_vocab, t->vocab_size);
     *n_tokens = 1; // the number of tokens
 
     // Okay UTF-8 time. This will get messy. Here is the reference from Wikipedia:
@@ -403,12 +466,13 @@ void bpe_encode(char *text, char **vocab, float *vocab_scores, int vocab_size, u
         str_buffer[str_len] = '\0';
 
         // while the next character is a continuation byte, continue appending
-        if ((*(c+1) & 0xC0) == 0x80) {
+        // but if there are too many of them, just stop to avoid overruning str_buffer size.
+        if ((*(c+1) & 0xC0) == 0x80 && str_len < 4) {
             continue;
         }
 
         // ok c+1 is not a continuation byte, so we've read in a full codepoint
-        int id = str_lookup(str_buffer, sorted_vocab, vocab_size);
+        int id = str_lookup(str_buffer, sorted_vocab, t->vocab_size);
 
         if (id != -1) {
             // we found this codepoint in vocab, add it as a token
@@ -421,6 +485,7 @@ void bpe_encode(char *text, char **vocab, float *vocab_scores, int vocab_size, u
                 tokens[(*n_tokens)++] = (unsigned char)str_buffer[i] + 3;
             }
         }
+        str_len = 0; // protect against a sequence of stray UTF8 continuation bytes
     }
 
     // merge the best consecutive pair each iteration, according the scores in vocab_scores
@@ -431,11 +496,11 @@ void bpe_encode(char *text, char **vocab, float *vocab_scores, int vocab_size, u
 
         for (int i=0; i < (*n_tokens-1); i++) {
             // check if we can merge the pair (tokens[i], tokens[i+1])
-            sprintf(str_buffer, "%s%s", vocab[tokens[i]], vocab[tokens[i+1]]);
-            int id = str_lookup(str_buffer, sorted_vocab, vocab_size);
-            if (id != -1 && vocab_scores[id] > best_score) {
+            sprintf(str_buffer, "%s%s", t->vocab[tokens[i]], t->vocab[tokens[i+1]]);
+            int id = str_lookup(str_buffer, sorted_vocab, t->vocab_size);
+            if (id != -1 && t->vocab_scores[id] > best_score) {
                 // this merge pair exists in vocab! record its score and position
-                best_score = vocab_scores[id];
+                best_score = t->vocab_scores[id];
                 best_id = id;
                 best_idx = i;
             }
@@ -482,6 +547,11 @@ float random_f32() { // random float32 in [0,1)
 
 
 
+
+typedef struct {
+    float prob;
+    int index;
+} ProbIndex; // struct used when sorting probabilities during top-p sampling
 
 int argmax(float* probabilities, int n) {
 
@@ -578,6 +648,7 @@ void error_usage() {
 	fprintf(stderr, "  -l <int> saveLogBool, 1 or 0 flag saves timestamps for tokens gen default 0\n");
 	fprintf(stderr, "  -g <int> groupLogBool, 1 or 0 flag group output by compiler default 0\n");
 	fprintf(stderr, "  -b <int> singleBOS, 1 or 0 flag default 1\n");
+	fprintf(stderr, "  -r <int> emitRawTokenBool, 1 or 0 flag default 0\n");	
 	fprintf(stderr, "  -d <string> dirname string, default none\n");
     exit(EXIT_FAILURE);
 }
@@ -585,8 +656,8 @@ void error_usage() {
 int main(int argc, char *argv[]) {
 
     // poor man's C argparse
-    char *checkpoint = NULL;  // e.g. out/model.bin
-    char *tokenizer = "tokenizer.bin";
+    char *checkpoint_path = NULL;  // e.g. out/model.bin
+    char *tokenizer_path = "tokenizer.bin";
     float temperature = 1.0f; // 0.0 = greedy deterministic. 1.0 = original. don't set higher
     float topp = 0.9f;        // top-p in nucleus sampling. 1.0 = off. 0.9 works well, but slower
     rng_seed = 0; // seed rng with time by default
@@ -596,12 +667,13 @@ int main(int argc, char *argv[]) {
 	int saveFileBool = 1;        // save to file printing
 	int saveLogBool = 0;         // save token timestamps to log
 	int groupLogBool = 0;        // group timelogs by compiler		
+	int emitRawTokenBool = 0;    // emit actual token ints			
 	char *dirname = "inbox"; 
 	char filename[MAX_FILENAME_LENGTH];
 	int singleBOS = 1;        // save to file printing
 
 
-    if (argc >= 2) { checkpoint = argv[1]; } else { error_usage(); }
+    if (argc >= 2) { checkpoint_path = argv[1]; } else { error_usage(); }
     for (int i = 2; i < argc; i+=2) {
         // do some basic validation
         if (i + 1 >= argc) { error_usage(); } // must have arg after flag
@@ -613,13 +685,14 @@ int main(int argc, char *argv[]) {
         else if (argv[i][1] == 's') { rng_seed = atoi(argv[i + 1]); }
         else if (argv[i][1] == 'n') { steps = atoi(argv[i + 1]); }
         else if (argv[i][1] == 'i') { prompt = argv[i + 1]; }
-        else if (argv[i][1] == 'z') { tokenizer = argv[i + 1]; }
+        else if (argv[i][1] == 'z') { tokenizer_path = argv[i + 1]; }
 		else if (argv[i][1] == 'k') { print_tokens = atoi( argv[i + 1]); }
 		else if (argv[i][1] == 'f') { saveFileBool = atoi( argv[i + 1]); }
 		else if (argv[i][1] == 'l') { saveLogBool = atoi( argv[i + 1]); }
 		else if (argv[i][1] == 'g') { groupLogBool = atoi( argv[i + 1]); }
 		else if (argv[i][1] == 'b') { singleBOS = atoi( argv[i + 1]); }
 		else if (argv[i][1] == 'd') { dirname = argv[i + 1]; }
+		else if (argv[i][1] == 'r') { emitRawTokenBool = atoi(argv[i + 1]); }
         else { error_usage(); }
     }
     if(rng_seed == 0) { rng_seed =  (unsigned int)time(NULL);}
@@ -638,7 +711,7 @@ int main(int argc, char *argv[]) {
 	    if (create_directory(dirname) != 0) {
 		return 1;
 	    }
- 	handle_log_file(saveLogBool, groupLogBool, dirname, COMPILER,  MorK(checkpoint), extractNumber(checkpoint), time_log, &timelog_file);
+ 	handle_log_file(saveLogBool, groupLogBool, dirname, COMPILER,  MorK(checkpoint_path), extractNumber(checkpoint_path), time_log, &timelog_file);
    
 
    // read in the model.bin file
@@ -647,58 +720,26 @@ int main(int argc, char *argv[]) {
     int fd = 0;         // file descriptor for memory mapping
     float* data = NULL; // memory mapped data pointer
     ssize_t file_size;     // size of the checkpoint file in bytes
-    {
-        FILE *file = fopen(checkpoint, "rb");
-        if (!file) { fprintf(stderr, "Couldn't open file %s\n", checkpoint); return 1; }
-        // read in the config header
-        if (fread(&config, sizeof(Config), 1, file) != 1) { return 1; }
-        // negative vocab size is hacky way of signaling unshared weights. bit yikes.
-        int shared_weights = config.vocab_size > 0 ? 1 : 0;
-        config.vocab_size = abs(config.vocab_size);
-        // figure out the file size
-        fseek(file, 0, SEEK_END); // move file pointer to end of file
-        file_size = ftell(file); // get the file size, in bytes
-        fclose(file);
-        // memory map the Transformer weights into the data pointer
-        fd = open(checkpoint, O_RDONLY); // open in read only mode
-        if (fd == -1) { fprintf(stderr, "open failed!\n"); return 1; }
-        data = mmap(NULL, file_size, PROT_READ, MAP_PRIVATE, fd, 0);
-        if (data == MAP_FAILED) { fprintf(stderr, "mmap failed!\n"); return 1; }
-        float* weights_ptr = data + sizeof(Config)/sizeof(float);
-        checkpoint_init_weights(&weights, &config, weights_ptr, shared_weights);
-    }
+    read_checkpoint(checkpoint_path, &config, &weights, &fd, &data, &file_size);
+
     // right now we cannot run for more than config.seq_len steps
     if (steps <= 0 || steps > config.seq_len) { steps = config.seq_len; }
 
     // read in the tokenizer.bin file
-    char** vocab = (char**)malloc(config.vocab_size * sizeof(char*));
-    float* vocab_scores = (float*)malloc(config.vocab_size * sizeof(float));
-    unsigned int max_token_length;
-    {
-        FILE *file = fopen(tokenizer, "rb");
-        if (!file) { fprintf(stderr, "couldn't load %s\n", tokenizer); return 1; }
-        if (fread(&max_token_length, sizeof(int), 1, file) != 1) { fprintf(stderr, "failed read\n"); return 1; }
-        int len;
-        for (int i = 0; i < config.vocab_size; i++) {
-            if (fread(vocab_scores + i, sizeof(float), 1, file) != 1) { fprintf(stderr, "failed read\n"); return 1;}
-            if (fread(&len, sizeof(int), 1, file) != 1) { fprintf(stderr, "failed read\n"); return 1; }
-            vocab[i] = (char *)malloc(len + 1);
-            if (fread(vocab[i], len, 1, file) != 1) { fprintf(stderr, "failed read\n"); return 1; }
-            vocab[i][len] = '\0'; // add the string terminating token
-        }
-        fclose(file);
-    }
+    Tokenizer tokenizer;
+    build_tokenizer(tokenizer_path, &tokenizer, config.vocab_size);
 
     // create and init the application RunState
     RunState state;
     malloc_run_state(&state, &config);
+    ProbIndex *probindex = malloc(config.vocab_size * sizeof(ProbIndex)); // buffer used in top-p sampling
 
     // process the prompt, if any
     int *prompt_tokens = NULL;
     int num_prompt_tokens = 0;
     if (prompt != NULL) {
         prompt_tokens = (int*)malloc((strlen(prompt)+1) * sizeof(int));
-        bpe_encode(prompt, vocab, vocab_scores, config.vocab_size, max_token_length, prompt_tokens, &num_prompt_tokens);
+        bpe_encode(&tokenizer, prompt, prompt_tokens, &num_prompt_tokens);
     }
 
     // start the main loop
@@ -731,42 +772,36 @@ int main(int argc, char *argv[]) {
                     next = sample(state.logits, config.vocab_size);
                 } else {
                     // top-p (nucleus) sampling, clamping the least likely tokens to zero
-                    next = sample_topp(state.logits, config.vocab_size, topp, state.probindex);
+                    next = sample_topp(state.logits, config.vocab_size, topp, probindex);
                 }
             }
         }     
         pos++;
-	token = next;
-        // init our timer here because the first iteration is slow due to memmap
-        if (start == 0) { start = time_in_ms(); }
 
 
+	char* piece = get_piece(&tokenizer, token, next);
+	piece = replaceDoubleQuotesWithFullwidth(piece);
+
+	if (print_tokens > 0){
  // following BOS token (1), sentencepiece decoder strips any leading whitespace (see PR #89)
-        char *token_str = (token == 1 && vocab[next][0] == ' ') ? vocab[next]+1 : vocab[next];
-		
-        if (print_tokens > 0) {
-		unsigned char byte_val;
-		if (sscanf(token_str, "<0x%02hhX>", &byte_val) == 1) {
-		    // ok this token is a raw byte token, carefuly to only print printable chars or whitespace
-		    // some of the other bytes can be various control codes, backspace, etc. => skip
-		    if (isprint(byte_val) || isspace(byte_val)) {
-		        char byte_piece[2];
-		        byte_piece[0] = byte_val;
-		        byte_piece[1] = '\0';
-		        printf("%s", byte_piece);
-		    }
-		}
-		else {	stripNewlines(token_str);
-			token_str = replaceDoubleQuotesWithFullwidth(token_str);
-			fprintf(stderr, "%s", token_str);
-			fflush(stdout);
-			}
-	}
-	
+
+				if(!emitRawTokenBool)
+					{
+					stripNewlines(piece);
+					fprintf(stderr, "%s", piece);
+					}
+				else
+					fprintf(stderr, "%i ", token);
+				fflush(stdout);
+				}
+
+        token = next;
+        // init the timer here because the first iteration can be slower
+        if (start == 0) { start = time_in_ms(); }
 
 	if(saveFileBool > 0 ){
 
-			strcat_s(tokens_so_far, MAX_STRING_SIZE, token_str);
+			strcat_s(tokens_so_far, MAX_STRING_SIZE, piece);
 		}
 
         // init the timer here because the first iteration can be slower
@@ -785,7 +820,7 @@ printf("\n");
         //if (pos > 1) {
         long end = time_in_ms();
 	//#ifdef COMPILER
-        fprintf(stderr, "\n\nachieved tok/s: %f for %s", (steps-1) / (double)(end-start)*1000, COMPILER);
+        fprintf(stderr, "\n\nachieved tok/s: %f for %s", (pos-1) / (double)(end-start)*1000, COMPILER);
     //#else
 		
 	//	fprintf(stderr, "\n\nachieved tok/s: %f", (steps-1) / (double)(end-start)*1000);
@@ -793,9 +828,8 @@ printf("\n");
 		//    }
     // memory and file handles cleanup
     free_run_state(&state);
-    for (int i = 0; i < config.vocab_size; i++) { free(vocab[i]); }
-    free(vocab);
-    free(vocab_scores);
+    free(probindex);
+    free_tokenizer(&tokenizer);
     free(output_file);
     fclose(output_file);
     if (prompt_tokens != NULL) free(prompt_tokens);
