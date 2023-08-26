@@ -737,7 +737,22 @@ long time_in_ms() {
 // ----------------------------------------------------------------------------
 // generation loop
 
-void generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, char *prompt, int steps) {
+void generate(
+    Transformer *transformer,
+    Tokenizer *tokenizer,
+    Sampler *sampler,
+    char *prompt,
+    int steps,
+    int saveFileBool,
+    char *tokens_so_far,
+    int saveLogBool,
+    FILE *timelog_file,
+    char *dirname,
+    char *timestamp,
+    int singleBOS,
+    int print_tokens,
+    int emitRawTokenBool
+) {
     char *empty_prompt = "";
     if (prompt == NULL) { prompt = empty_prompt; }
 
@@ -778,7 +793,7 @@ void generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, 
 
 	piece = replaceDoubleQuotesWithFullwidth(piece);
 
-	if (printTokens){
+	if (print_tokens){
 
 		if(!emitRawTokenBool)
 			{
